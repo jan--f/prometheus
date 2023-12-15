@@ -47,7 +47,7 @@ import (
 // the re-arrangement work is actually causing problems (which has to be seen),
 // that expectation needs to be changed.
 type ProtobufParser struct {
-	in        []byte // The intput to parse.
+	in        []byte // The input to parse.
 	inPos     int    // Position within the input.
 	metricPos int    // Position within Metric slice.
 	// fieldPos is the position within a Summary or (legacy) Histogram. -2
@@ -179,6 +179,17 @@ func (p *ProtobufParser) Histogram() ([]byte, *int64, *histogram.Histogram, *his
 	if p.parseClassicHistograms && len(h.GetBucket()) > 0 {
 		p.redoClassic = true
 	}
+	sh, fh := ProtoToHistogram(h, p.mf.GetType())
+	if ts != 0 {
+		return p.metricBytes.Bytes(), &ts, sh, fh
+	}
+	// Nasty hack: Assume that ts==0 means no timestamp. That's not true in
+	// general, but proto3 has no distinction between unset and
+	// default. Need to avoid in the final format.
+	return p.metricBytes.Bytes(), nil, sh, fh
+}
+
+func ProtoToHistogram(h *dto.Histogram, mType dto.MetricType) (*histogram.Histogram, *histogram.FloatHistogram) {
 	if h.GetSampleCountFloat() > 0 || h.GetZeroCountFloat() > 0 {
 		// It is a float histogram.
 		fh := histogram.FloatHistogram{
@@ -200,17 +211,11 @@ func (p *ProtobufParser) Histogram() ([]byte, *int64, *histogram.Histogram, *his
 			fh.NegativeSpans[i].Offset = span.GetOffset()
 			fh.NegativeSpans[i].Length = span.GetLength()
 		}
-		if p.mf.GetType() == dto.MetricType_GAUGE_HISTOGRAM {
+		if mType == dto.MetricType_GAUGE_HISTOGRAM {
 			fh.CounterResetHint = histogram.GaugeType
 		}
 		fh.Compact(0)
-		if ts != 0 {
-			return p.metricBytes.Bytes(), &ts, nil, &fh
-		}
-		// Nasty hack: Assume that ts==0 means no timestamp. That's not true in
-		// general, but proto3 has no distinction between unset and
-		// default. Need to avoid in the final format.
-		return p.metricBytes.Bytes(), nil, nil, &fh
+		return nil, &fh
 	}
 
 	sh := histogram.Histogram{
@@ -232,14 +237,11 @@ func (p *ProtobufParser) Histogram() ([]byte, *int64, *histogram.Histogram, *his
 		sh.NegativeSpans[i].Offset = span.GetOffset()
 		sh.NegativeSpans[i].Length = span.GetLength()
 	}
-	if p.mf.GetType() == dto.MetricType_GAUGE_HISTOGRAM {
+	if mType == dto.MetricType_GAUGE_HISTOGRAM {
 		sh.CounterResetHint = histogram.GaugeType
 	}
 	sh.Compact(0)
-	if ts != 0 {
-		return p.metricBytes.Bytes(), &ts, &sh, nil
-	}
-	return p.metricBytes.Bytes(), nil, &sh, nil
+	return &sh, nil
 }
 
 // Help returns the metric name and help text in the current entry.
