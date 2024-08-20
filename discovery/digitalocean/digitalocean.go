@@ -23,7 +23,8 @@ import (
 	"time"
 
 	"github.com/digitalocean/godo"
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/version"
@@ -47,6 +48,7 @@ const (
 	doLabelStatus      = doLabel + "status"
 	doLabelFeatures    = doLabel + "features"
 	doLabelTags        = doLabel + "tags"
+	doLabelVPC         = doLabel + "vpc"
 	separator          = ","
 )
 
@@ -59,6 +61,13 @@ var DefaultSDConfig = SDConfig{
 
 func init() {
 	discovery.RegisterConfig(&SDConfig{})
+}
+
+// NewDiscovererMetrics implements discovery.Config.
+func (*SDConfig) NewDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
+	return &digitaloceanMetrics{
+		refreshMetrics: rmi,
+	}
 }
 
 // SDConfig is the configuration for DigitalOcean based service discovery.
@@ -74,7 +83,7 @@ func (*SDConfig) Name() string { return "digitalocean" }
 
 // NewDiscoverer returns a Discoverer for the Config.
 func (c *SDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewDiscovery(c, opts.Logger)
+	return NewDiscovery(c, opts.Logger, opts.Metrics)
 }
 
 // SetDirectory joins any relative file paths with dir.
@@ -102,12 +111,17 @@ type Discovery struct {
 }
 
 // NewDiscovery returns a new Discovery which periodically refreshes its targets.
-func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
+func NewDiscovery(conf *SDConfig, logger log.Logger, metrics discovery.DiscovererMetrics) (*Discovery, error) {
+	m, ok := metrics.(*digitaloceanMetrics)
+	if !ok {
+		return nil, fmt.Errorf("invalid discovery metrics type")
+	}
+
 	d := &Discovery{
 		port: conf.Port,
 	}
 
-	rt, err := config.NewRoundTripperFromConfig(conf.HTTPClientConfig, "digitalocean_sd", false, false)
+	rt, err := config.NewRoundTripperFromConfig(conf.HTTPClientConfig, "digitalocean_sd")
 	if err != nil {
 		return nil, err
 	}
@@ -124,10 +138,13 @@ func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
 	}
 
 	d.Discovery = refresh.NewDiscovery(
-		logger,
-		"digitalocean",
-		time.Duration(conf.RefreshInterval),
-		d.refresh,
+		refresh.Options{
+			Logger:              logger,
+			Mech:                "digitalocean",
+			Interval:            time.Duration(conf.RefreshInterval),
+			RefreshF:            d.refresh,
+			MetricsInstantiator: m.refreshMetrics,
+		},
 	)
 	return d, nil
 }
@@ -137,7 +154,7 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 		Source: "DigitalOcean",
 	}
 
-	droplets, err := d.listDroplets()
+	droplets, err := d.listDroplets(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +177,7 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 		}
 
 		labels := model.LabelSet{
-			doLabelID:          model.LabelValue(fmt.Sprintf("%d", droplet.ID)),
+			doLabelID:          model.LabelValue(strconv.Itoa(droplet.ID)),
 			doLabelName:        model.LabelValue(droplet.Name),
 			doLabelImage:       model.LabelValue(droplet.Image.Slug),
 			doLabelImageName:   model.LabelValue(droplet.Image.Name),
@@ -170,6 +187,7 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 			doLabelRegion:      model.LabelValue(droplet.Region.Slug),
 			doLabelSize:        model.LabelValue(droplet.SizeSlug),
 			doLabelStatus:      model.LabelValue(droplet.Status),
+			doLabelVPC:         model.LabelValue(droplet.VPCUUID),
 		}
 
 		addr := net.JoinHostPort(publicIPv4, strconv.FormatUint(uint64(d.port), 10))
@@ -194,13 +212,13 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 	return []*targetgroup.Group{tg}, nil
 }
 
-func (d *Discovery) listDroplets() ([]godo.Droplet, error) {
+func (d *Discovery) listDroplets(ctx context.Context) ([]godo.Droplet, error) {
 	var (
 		droplets []godo.Droplet
 		opts     = &godo.ListOptions{}
 	)
 	for {
-		paginatedDroplets, resp, err := d.client.Droplets.List(context.Background(), opts)
+		paginatedDroplets, resp, err := d.client.Droplets.List(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("error while listing droplets page %d: %w", opts.Page, err)
 		}
