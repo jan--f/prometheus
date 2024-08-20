@@ -21,11 +21,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
+	"gopkg.in/yaml.v2"
 
+	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
@@ -33,20 +37,30 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
+// TODO: Add ability to unregister metrics?
+func NewTestMetrics(t *testing.T, conf discovery.Config, reg prometheus.Registerer) discovery.DiscovererMetrics {
+	refreshMetrics := discovery.NewRefreshMetrics(reg)
+	require.NoError(t, refreshMetrics.Register())
+
+	metrics := conf.NewDiscovererMetrics(prometheus.NewRegistry(), refreshMetrics)
+	require.NoError(t, metrics.Register())
+
+	return metrics
+}
+
 func TestConfiguredService(t *testing.T) {
 	conf := &SDConfig{
-		Services: []string{"configuredServiceName"}}
-	consulDiscovery, err := NewDiscovery(conf, nil)
+		Services: []string{"configuredServiceName"},
+	}
 
-	if err != nil {
-		t.Errorf("Unexpected error when initializing discovery %v", err)
-	}
-	if !consulDiscovery.shouldWatch("configuredServiceName", []string{""}) {
-		t.Errorf("Expected service %s to be watched", "configuredServiceName")
-	}
-	if consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{""}) {
-		t.Errorf("Expected service %s to not be watched", "nonConfiguredServiceName")
-	}
+	metrics := NewTestMetrics(t, conf, prometheus.NewRegistry())
+
+	consulDiscovery, err := NewDiscovery(conf, nil, metrics)
+	require.NoError(t, err, "when initializing discovery")
+	require.True(t, consulDiscovery.shouldWatch("configuredServiceName", []string{""}),
+		"Expected service %s to be watched", "configuredServiceName")
+	require.False(t, consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{""}),
+		"Expected service %s to not be watched", "nonConfiguredServiceName")
 }
 
 func TestConfiguredServiceWithTag(t *testing.T) {
@@ -54,23 +68,22 @@ func TestConfiguredServiceWithTag(t *testing.T) {
 		Services:    []string{"configuredServiceName"},
 		ServiceTags: []string{"http"},
 	}
-	consulDiscovery, err := NewDiscovery(conf, nil)
 
-	if err != nil {
-		t.Errorf("Unexpected error when initializing discovery %v", err)
-	}
-	if consulDiscovery.shouldWatch("configuredServiceName", []string{""}) {
-		t.Errorf("Expected service %s to not be watched without tag", "configuredServiceName")
-	}
-	if !consulDiscovery.shouldWatch("configuredServiceName", []string{"http"}) {
-		t.Errorf("Expected service %s to be watched with tag %s", "configuredServiceName", "http")
-	}
-	if consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{""}) {
-		t.Errorf("Expected service %s to not be watched without tag", "nonConfiguredServiceName")
-	}
-	if consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{"http"}) {
-		t.Errorf("Expected service %s to not be watched with tag %s", "nonConfiguredServiceName", "http")
-	}
+	metrics := NewTestMetrics(t, conf, prometheus.NewRegistry())
+
+	consulDiscovery, err := NewDiscovery(conf, nil, metrics)
+	require.NoError(t, err, "when initializing discovery")
+	require.False(t, consulDiscovery.shouldWatch("configuredServiceName", []string{""}),
+		"Expected service %s to not be watched without tag", "configuredServiceName")
+
+	require.True(t, consulDiscovery.shouldWatch("configuredServiceName", []string{"http"}),
+		"Expected service %s to be watched with tag %s", "configuredServiceName", "http")
+
+	require.False(t, consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{""}),
+		"Expected service %s to not be watched without tag", "nonConfiguredServiceName")
+
+	require.False(t, consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{"http"}),
+		"Expected service %s to not be watched with tag %s", "nonConfiguredServiceName", "http")
 }
 
 func TestConfiguredServiceWithTags(t *testing.T) {
@@ -150,29 +163,24 @@ func TestConfiguredServiceWithTags(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		consulDiscovery, err := NewDiscovery(tc.conf, nil)
+		metrics := NewTestMetrics(t, tc.conf, prometheus.NewRegistry())
 
-		if err != nil {
-			t.Errorf("Unexpected error when initializing discovery %v", err)
-		}
+		consulDiscovery, err := NewDiscovery(tc.conf, nil, metrics)
+		require.NoError(t, err, "when initializing discovery")
 		ret := consulDiscovery.shouldWatch(tc.serviceName, tc.serviceTags)
-		if ret != tc.shouldWatch {
-			t.Errorf("Expected should watch? %t, got %t. Watched service and tags: %s %+v, input was %s %+v", tc.shouldWatch, ret, tc.conf.Services, tc.conf.ServiceTags, tc.serviceName, tc.serviceTags)
-		}
-
+		require.Equal(t, tc.shouldWatch, ret, "Watched service and tags: %s %+v, input was %s %+v",
+			tc.conf.Services, tc.conf.ServiceTags, tc.serviceName, tc.serviceTags)
 	}
 }
 
 func TestNonConfiguredService(t *testing.T) {
 	conf := &SDConfig{}
-	consulDiscovery, err := NewDiscovery(conf, nil)
 
-	if err != nil {
-		t.Errorf("Unexpected error when initializing discovery %v", err)
-	}
-	if !consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{""}) {
-		t.Errorf("Expected service %s to be watched", "nonConfiguredServiceName")
-	}
+	metrics := NewTestMetrics(t, conf, prometheus.NewRegistry())
+
+	consulDiscovery, err := NewDiscovery(conf, nil, metrics)
+	require.NoError(t, err, "when initializing discovery")
+	require.True(t, consulDiscovery.shouldWatch("nonConfiguredServiceName", []string{""}), "Expected service %s to be watched", "nonConfiguredServiceName")
 }
 
 const (
@@ -263,19 +271,22 @@ func newServer(t *testing.T) (*httptest.Server, *SDConfig) {
 
 func newDiscovery(t *testing.T, config *SDConfig) *Discovery {
 	logger := log.NewNopLogger()
-	d, err := NewDiscovery(config, logger)
+
+	metrics := NewTestMetrics(t, config, prometheus.NewRegistry())
+
+	d, err := NewDiscovery(config, logger, metrics)
 	require.NoError(t, err)
 	return d
 }
 
 func checkOneTarget(t *testing.T, tg []*targetgroup.Group) {
-	require.Equal(t, 1, len(tg))
+	require.Len(t, tg, 1)
 	target := tg[0]
 	require.Equal(t, "test-dc", string(target.Labels["__meta_consul_dc"]))
 	require.Equal(t, target.Source, string(target.Labels["__meta_consul_service"]))
 	if target.Source == "test" {
 		// test service should have one node.
-		require.Greater(t, len(target.Targets), 0, "Test service should have one node")
+		require.NotEmpty(t, target.Targets, "Test service should have one node")
 	}
 }
 
@@ -294,6 +305,27 @@ func TestAllServices(t *testing.T) {
 	}()
 	checkOneTarget(t, <-ch)
 	checkOneTarget(t, <-ch)
+	cancel()
+	<-ch
+}
+
+// targetgroup with no targets is emitted if no services were discovered.
+func TestNoTargets(t *testing.T) {
+	stub, config := newServer(t)
+	defer stub.Close()
+	config.ServiceTags = []string{"missing"}
+
+	d := newDiscovery(t, config)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan []*targetgroup.Group)
+	go func() {
+		d.Run(ctx, ch)
+		close(ch)
+	}()
+
+	targets := (<-ch)[0].Targets
+	require.Empty(t, targets)
 	cancel()
 	<-ch
 }
@@ -345,7 +377,7 @@ func TestGetDatacenterShouldReturnError(t *testing.T) {
 		{
 			// Define a handler that will return status 500.
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(500)
+				w.WriteHeader(http.StatusInternalServerError)
 			},
 			errMessage: "Unexpected response code: 500 ()",
 		},
@@ -378,5 +410,90 @@ func TestGetDatacenterShouldReturnError(t *testing.T) {
 		require.Equal(t, tc.errMessage, err.Error())
 		// Should still be empty.
 		require.Equal(t, "", d.clientDatacenter)
+	}
+}
+
+func TestUnmarshalConfig(t *testing.T) {
+	unmarshal := func(d []byte) func(interface{}) error {
+		return func(o interface{}) error {
+			return yaml.Unmarshal(d, o)
+		}
+	}
+
+	goodConfig := DefaultSDConfig
+	goodConfig.Username = "123"
+	goodConfig.Password = "1234"
+	goodConfig.HTTPClientConfig = config.HTTPClientConfig{
+		BasicAuth: &config.BasicAuth{
+			Username: "123",
+			Password: "1234",
+		},
+		FollowRedirects: true,
+		EnableHTTP2:     true,
+	}
+
+	cases := []struct {
+		name       string
+		config     string
+		expected   SDConfig
+		errMessage string
+	}{
+		{
+			name: "good",
+			config: `
+server: localhost:8500
+username: 123
+password: 1234
+`,
+			expected: goodConfig,
+		},
+		{
+			name: "username and password and basic auth configured",
+			config: `
+server: localhost:8500
+username: 123
+password: 1234
+basic_auth:
+  username: 12345
+  password: 123456
+`,
+			errMessage: "at most one of consul SD configuration username and password and basic auth can be configured",
+		},
+		{
+			name: "token and authorization configured",
+			config: `
+server: localhost:8500
+token: 1234567
+authorization:
+  credentials: 12345678
+`,
+			errMessage: "at most one of consul SD token, authorization, or oauth2 can be configured",
+		},
+		{
+			name: "token and oauth2 configured",
+			config: `
+server: localhost:8500
+token: 1234567
+oauth2:
+  client_id: 10
+  client_secret: 11
+  token_url: http://example.com
+`,
+			errMessage: "at most one of consul SD token, authorization, or oauth2 can be configured",
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var config SDConfig
+			err := config.UnmarshalYAML(unmarshal([]byte(test.config)))
+			if err != nil {
+				require.EqualError(t, err, test.errMessage)
+				return
+			}
+			require.Empty(t, test.errMessage, "Expected error.")
+
+			require.Equal(t, test.expected, config)
+		})
 	}
 }
