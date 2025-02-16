@@ -132,7 +132,11 @@ jobs:
     name: Build Prometheus for all architectures
     runs-on: ubuntu-latest
     if: |
-      (github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'main'))
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v2.'))
+      ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v3.'))
+      ||
+      (github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'release-'))
       ||
       (github.event_name == 'push' && github.event.ref == 'refs/heads/main')
     strategy:
